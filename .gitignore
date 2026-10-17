@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+build/
+dist/
+*.spec.bak
+.pytest_cache/
+# Local settings may contain real income data - never commit
+settings.json
+earnticker_settings.json
