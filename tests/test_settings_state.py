@@ -342,3 +342,14 @@ def test_state_touch_and_prune(tmp_path):
     store.prune(date(2026, 10, 19))
     assert date(2024, 1, 1) not in store.records
     assert store.get(date(2026, 10, 19)).last_seen == datetime(2026, 10, 19, 18, 0)
+
+
+def test_resource_path_from_source_and_frozen(tmp_path):
+    from earnticker.resources import HOLIDAYS_EXAMPLE, resource_path
+
+    src = resource_path(HOLIDAYS_EXAMPLE, frozen=False)
+    assert src == ROOT / "config" / "holidays.example.json"
+    assert src.is_file()
+    assert "2026-01-01" in parse_holiday_file(settings_mod.read_json(src))
+    frozen = resource_path(HOLIDAYS_EXAMPLE, frozen=True, bundle_dir=tmp_path)
+    assert frozen == tmp_path / "config" / "holidays.example.json"

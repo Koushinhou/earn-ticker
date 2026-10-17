@@ -18,12 +18,12 @@ class Tray(QSystemTrayIcon):
     quit_requested = Signal()
 
     def __init__(
-        self, is_panel_visible: Callable[[], bool], is_overtime_running: Callable[[], bool]
+        self, is_panel_visible: Callable[[], bool], is_overtime_active: Callable[[], bool]
     ) -> None:
         super().__init__(coin_icon())
         self.setToolTip("EarnTicker")
         self._is_panel_visible = is_panel_visible
-        self._is_overtime_running = is_overtime_running
+        self._is_overtime_active = is_overtime_active
 
         menu = QMenu()
         menu.setFont(app_font(point_size=9.5))
@@ -47,7 +47,7 @@ class Tray(QSystemTrayIcon):
 
     def _update_texts(self) -> None:
         self.act_toggle.setText("隐藏面板" if self._is_panel_visible() else "显示面板")
-        self.act_overtime.setText("结束加班" if self._is_overtime_running() else "开始加班")
+        self.act_overtime.setText("结束加班" if self._is_overtime_active() else "开始加班")
 
     def _on_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
         if reason == QSystemTrayIcon.ActivationReason.Trigger:

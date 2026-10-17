@@ -48,7 +48,8 @@ class Panel(QWidget):
         self._prev: tuple[datetime, float] | None = None
         self._last_date = None
         self._last_touch: datetime | None = None
-        self.overtime_running = False
+        # toggle state for the menus: 「结束加班」 vs 「开始加班」
+        self.overtime_active = False
 
         self.clock_label = QLabel(self)
         self.amount_label = QLabel(self)
@@ -160,7 +161,7 @@ class Panel(QWidget):
 
         records = self.store.records
         day = compute_day(rules, today, records.get(today), now)
-        self.overtime_running = day.overtime_running
+        self.overtime_active = day.overtime_active
         sym = s.currency_symbol
         total = day.total
 
@@ -170,6 +171,8 @@ class Panel(QWidget):
         status = ""
         if day.overtime_running:
             status = f"加班中 ×{day.current_coef:g} · 其中加班 {fmt_money(sym, day.overtime, 2)}"
+        elif day.overtime_pending_from is not None:
+            status = f"已开始加班（{day.overtime_pending_from:%H:%M} 起计）"
         elif day.phase == "rest":
             status = "今天休息"
             if day.overtime > 0:
@@ -278,7 +281,7 @@ class Panel(QWidget):
         menu.setFont(app_font(point_size=9.5))
         act_settings = QAction("设置…", menu)
         act_settings.triggered.connect(self.settings_requested.emit)
-        act_ot = QAction("结束加班" if self.overtime_running else "开始加班", menu)
+        act_ot = QAction("结束加班" if self.overtime_active else "开始加班", menu)
         act_ot.triggered.connect(self.overtime_toggle_requested.emit)
         act_hide = QAction("收起到托盘", menu)
         act_hide.triggered.connect(self.hide_requested.emit)

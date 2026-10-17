@@ -5,18 +5,19 @@ from __future__ import annotations
 import argparse
 import contextlib
 import sys
+import threading
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QLockFile, QTimer
-from PySide6.QtWidgets import QApplication, QMessageBox
+from PySide6.QtCore import QLockFile, QObject, QTimer, Signal
+from PySide6.QtWidgets import QApplication, QMessageBox, QSystemTrayIcon
 
 from . import autostart
 from .settings import (
     SETTINGS_FILE,
     STATE_FILE,
     Settings,
-    load_settings,
+    read_settings,
     resolve_config_dir,
     save_settings,
 )
@@ -25,6 +26,8 @@ from .ui.common import Clock, app_font, coin_icon
 from .ui.panel import Panel
 from .ui.settings_dialog import SettingsDialog
 from .ui.tray import Tray
+
+AUTOSTART_FAILED = "无法修改「启动」文件夹中的快捷方式（开机自启需要 PowerShell，可能已被禁用）。"
 
 
 class OffsetClock(Clock):
@@ -37,14 +40,34 @@ class OffsetClock(Clock):
         return (datetime.now() + self.offset).replace(microsecond=0)
 
 
+def corruption_notice(settings_corrupt: bool, state_corrupt: bool) -> str | None:
+    """One-time message after a corrupt JSON file was backed up and replaced."""
+    parts = []
+    if settings_corrupt:
+        parts.append("设置文件损坏，已备份并恢复默认")
+    if state_corrupt:
+        parts.append("加班记录文件损坏，已备份并重新开始记录")
+    return "；".join(parts) + "。" if parts else None
+
+
+class _Bridge(QObject):
+    """Delivers results from worker threads to the GUI thread."""
+
+    autostart_refreshed = Signal(bool)
+
+
 class Controller:
     def __init__(self, config_dir: Path, clock: Clock, *, use_tray: bool = True) -> None:
         self.config_dir = config_dir
         self.settings_path = config_dir / SETTINGS_FILE
-        self.settings, existed = load_settings(self.settings_path)
-        self.first_run = not existed
+        loaded = read_settings(self.settings_path)
+        self.settings = loaded.settings
+        self.first_run = not loaded.existed
         self.store = StateStore(config_dir / STATE_FILE)
         self.store.load()
+        self.notice = corruption_notice(loaded.corrupt, self.store.corrupt)
+        self._bridge = _Bridge()
+        self._bridge.autostart_refreshed.connect(self._autostart_refreshed)
         self.clock = clock
         self.dialog: SettingsDialog | None = None
 
@@ -57,7 +80,7 @@ class Controller:
 
         self.tray: Tray | None = None
         if use_tray and Tray.isSystemTrayAvailable():
-            self.tray = Tray(self.panel.isVisible, lambda: self.panel.overtime_running)
+            self.tray = Tray(self.panel.isVisible, lambda: self.panel.overtime_active)
             self.tray.toggle_panel_requested.connect(self.toggle_panel)
             self.tray.overtime_toggle_requested.connect(self.toggle_overtime)
             self.tray.settings_requested.connect(self.open_settings)
@@ -68,9 +91,42 @@ class Controller:
         self.panel.restore_position()
         self.panel.show()
         self.panel.start()
+        if self.first_run or self.notice:
+            self._save()
+        if self.notice:
+            QTimer.singleShot(500, lambda: self.show_message(self.notice or ""))
         if self.first_run:
-            save_settings(self.settings_path, self.settings)
             QTimer.singleShot(300, self.open_settings)
+        if self.settings.autostart and getattr(sys, "frozen", False):
+            self._refresh_autostart_async()
+
+    def show_message(self, text: str, warning: bool = True) -> None:
+        """Tray balloon if available, otherwise a message box."""
+        icon = (
+            QSystemTrayIcon.MessageIcon.Warning
+            if warning
+            else QSystemTrayIcon.MessageIcon.Information
+        )
+        if self.tray is not None and self.tray.supportsMessages():
+            self.tray.showMessage("EarnTicker", text, icon, 8000)
+        else:
+            QMessageBox.warning(self.panel, "EarnTicker", text)
+
+    def _refresh_autostart_async(self) -> None:
+        """Re-point the Startup shortcut at this exe (PowerShell runs off the GUI thread)."""
+
+        def work() -> None:
+            try:
+                ok = autostart.refresh()
+            except Exception:  # never let a background check crash the app
+                ok = False
+            self._bridge.autostart_refreshed.emit(ok)
+
+        threading.Thread(target=work, name="autostart-refresh", daemon=True).start()
+
+    def _autostart_refreshed(self, ok: bool) -> None:
+        if not ok:
+            self.show_message(AUTOSTART_FAILED)
 
     # -- actions ------------------------------------------------------------
 
@@ -122,9 +178,12 @@ class Controller:
         old_autostart = self.settings.autostart
         self.settings = self._with_position(s)
         if s.autostart != old_autostart or s.autostart != autostart.is_enabled():
-            ok = autostart.apply(s.autostart)
-            if not ok and self.dialog is not None:
-                QMessageBox.warning(self.dialog, "开机自启", "无法修改「启动」文件夹中的快捷方式。")
+            try:
+                ok = autostart.apply(s.autostart)
+            except Exception:
+                ok = False
+            if not ok:
+                QMessageBox.warning(self.dialog or self.panel, "开机自启", AUTOSTART_FAILED)
         self.panel.apply_settings(self.settings)
         self._save()
 

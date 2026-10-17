@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from datetime import date
 from pathlib import Path
 
@@ -32,10 +31,32 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..settings import Settings, parse_hhmm, parse_holiday_file
+from ..resources import HOLIDAYS_EXAMPLE, resource_path
+from ..settings import (
+    CAP_RANGE,
+    COEF_RANGE,
+    MAX_ANNUAL_INCOME,
+    Settings,
+    parse_hhmm,
+    parse_holiday_file,
+    read_json,
+)
 from .common import app_font, coin_icon, fmt_money
 
 WEEKDAY_NAMES = ["一", "二", "三", "四", "五", "六", "日"]
+
+
+def config_location_hint(config_dir: Path | None) -> str:
+    """Text for the 「其他」 tab: where settings live, plus a OneDrive warning."""
+    if config_dir is None:
+        return "设置保存位置：（未保存）"
+    text = f"设置保存位置：\n{config_dir}"
+    if "onedrive" in str(config_dir).lower():
+        text += (
+            "\n\n⚠ 该文件夹由 OneDrive 同步，含年收入的设置文件会被上传到云端。"
+            "建议把 EarnTicker.exe 放到不同步的文件夹（如 C:\\Tools\\EarnTicker\\）。"
+        )
+    return text
 
 
 class SettingsDialog(QDialog):
@@ -109,7 +130,7 @@ class SettingsDialog(QDialog):
     def _build_income_tab(self) -> QWidget:
         w = QWidget()
         form = QFormLayout(w)
-        self.income = self._dspin(0, 1e12, 100_000, 0)
+        self.income = self._dspin(0, MAX_ANNUAL_INCOME, 100_000, 0)
         self.income.setGroupSeparatorShown(True)
         self.currency = QLineEdit()
         self.currency.setMaxLength(4)
@@ -160,20 +181,27 @@ class SettingsDialog(QDialog):
     def _build_overtime_tab(self) -> QWidget:
         w = QWidget()
         form = QFormLayout(w)
-        self.auto_overtime = self._check("下班后自动计算加班（直到点「结束加班」）")
-        self.coef_weekday = self._dspin(0, 10, 0.05, 2)
-        self.coef_late = self._dspin(0, 10, 0.05, 2)
-        self.coef_rest = self._dspin(0, 10, 0.05, 2)
-        for sb in (self.coef_weekday, self.coef_late, self.coef_rest):
+        self.auto_overtime = self._check("下班后自动计算加班")
+        self.auto_cap = self._dspin(*CAP_RANGE, 0.5, 1)
+        self.auto_cap.setSuffix(" 小时")
+        self.coef_weekday = self._dspin(*COEF_RANGE, 0.05, 2)
+        self.coef_late = self._dspin(*COEF_RANGE, 0.05, 2)
+        self.coef_rest = self._dspin(*COEF_RANGE, 0.05, 2)
+        self.coef_rest_late = self._dspin(*COEF_RANGE, 0.05, 2)
+        for sb in (self.coef_weekday, self.coef_late, self.coef_rest, self.coef_rest_late):
             sb.setPrefix("× ")
         form.addRow(self.auto_overtime)
+        form.addRow("自动加班上限（下班后）", self.auto_cap)
         form.addRow("平日加班系数", self.coef_weekday)
-        form.addRow("深夜系数（22:00–05:00）", self.coef_late)
+        form.addRow("平日深夜系数（22:00–05:00）", self.coef_late)
         form.addRow("休息日系数", self.coef_rest)
+        form.addRow("休息日深夜系数", self.coef_rest_late)
         note = QLabel(
-            "系数不叠加：平日深夜按深夜系数；休息日深夜取休息日与深夜系数中较大者。"
-            "也可在面板右键菜单或托盘菜单手动「开始/结束加班」，可多次。"
-            "加班按天结算，到午夜 0 点截止（之后算到第二天）。"
+            "自动加班最多计到「下班时间 + 上限」（默认 17:15 + 3 小时 = 20:15），"
+            "提前点「结束加班」则到点击时为止。"
+            "手动「开始/结束加班」（面板右键菜单或托盘菜单，可多次）不受上限限制；"
+            "上班时间内开始的手动加班从下班时间起计。"
+            "系数不叠加。加班按天结算，到午夜 0 点截止（之后算到第二天）。"
         )
         note.setWordWrap(True)
         form.addRow(note)
@@ -193,6 +221,8 @@ class SettingsDialog(QDialog):
         btn_del = QPushButton("删除选中")
         btn_del.clicked.connect(self._remove_holidays)
         btn_import = QPushButton("导入 JSON…")
+        btn_import_jp = QPushButton("导入日本假日（2026–2027 示例）")
+        btn_import_jp.clicked.connect(lambda: self.import_example_holidays())
         btn_import.clicked.connect(self._import_holidays)
         btn_clear = QPushButton("清空")
         btn_clear.clicked.connect(self._clear_holidays)
@@ -205,9 +235,10 @@ class SettingsDialog(QDialog):
         v.addWidget(QLabel("假日（这些日期按休息日处理）："))
         v.addWidget(self.holiday_list)
         v.addLayout(add_row)
-        hint = QLabel("可导入示例文件 config/holidays.example.json（日本 2026–2027 法定假日）。")
-        hint.setWordWrap(True)
-        v.addWidget(hint)
+        jp_row = QHBoxLayout()
+        jp_row.addWidget(btn_import_jp)
+        jp_row.addStretch(1)
+        v.addLayout(jp_row)
         return w
 
     def _build_look_tab(self) -> QWidget:
@@ -246,14 +277,16 @@ class SettingsDialog(QDialog):
         v = QVBoxLayout(w)
         self.autostart = self._check("开机自动启动（在「启动」文件夹创建快捷方式）")
         v.addWidget(self.autostart)
-        where = str(config_dir) if config_dir else "（未保存）"
+        self.config_hint = QLabel(config_location_hint(config_dir))
+        self.config_hint.setWordWrap(True)
+        self.config_hint.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        v.addWidget(self.config_hint)
         info = QLabel(
-            f"设置保存位置：\n{where}\n\n"
             "EarnTicker 完全离线运行：不联网、不上传、不写注册表、不需要管理员权限。"
-            "年收入等数据只保存在本机。"
+            "年收入等数据只保存在本机（如果所在文件夹被 OneDrive 等同步，则会随之同步）。"
+            "开机自启通过 PowerShell 创建快捷方式；若 PowerShell 被禁用则可能失败。"
         )
         info.setWordWrap(True)
-        info.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         v.addWidget(info)
         v.addStretch(1)
         return w
@@ -277,9 +310,11 @@ class SettingsDialog(QDialog):
         for i, cb in enumerate(self.weekday_checks):
             cb.setChecked(i in s.work_weekdays)
         self.auto_overtime.setChecked(s.auto_overtime)
+        self.auto_cap.setValue(s.auto_overtime_cap_hours)
         self.coef_weekday.setValue(s.coef_weekday)
         self.coef_late.setValue(s.coef_late_night)
         self.coef_rest.setValue(s.coef_rest_day)
+        self.coef_rest_late.setValue(s.coef_rest_late_night)
         self.holiday_list.clear()
         self.holiday_list.addItems(sorted(s.holidays))
         self.font_size.setValue(s.font_size)
@@ -307,9 +342,11 @@ class SettingsDialog(QDialog):
         s.end_time = self.end_time.time().toString("HH:mm")
         s.work_weekdays = [i for i, cb in enumerate(self.weekday_checks) if cb.isChecked()]
         s.auto_overtime = self.auto_overtime.isChecked()
+        s.auto_overtime_cap_hours = self.auto_cap.value()
         s.coef_weekday = self.coef_weekday.value()
         s.coef_late_night = self.coef_late.value()
         s.coef_rest_day = self.coef_rest.value()
+        s.coef_rest_late_night = self.coef_rest_late.value()
         s.holidays = [self.holiday_list.item(i).text() for i in range(self.holiday_list.count())]
         s.font_size = self.font_size.value()
         s.panel_width = self.panel_width.value()
@@ -339,8 +376,8 @@ class SettingsDialog(QDialog):
             f"日薪 {fmt_money(sym, rules.daily, 2)} · 时薪 {fmt_money(sym, rules.hourly, 2)}"
             f" · 秒薪 {fmt_money(sym, rules.per_second, 4)}"
         )
-        if rules.working_days <= 0:
-            text += "\n⚠ 年工作日必须大于 0"
+        if self.rest_days.value() + self.leave_days.value() >= self.days_in_year.value():
+            text += f"\n⚠ 休息日 + 年假过多，按年工作日 {rules.working_days} 天计算"
         if s.take_home_enabled:
             text += f"\n（面板金额按到手比例 {s.take_home_ratio:.0%} 显示）"
         self.summary.setText(text)
@@ -402,17 +439,28 @@ class SettingsDialog(QDialog):
         path, _ = QFileDialog.getOpenFileName(self, "导入假日 JSON", "", "JSON (*.json)")
         if not path:
             return
+        self._import_holiday_file(Path(path), quiet=False)
+
+    def import_example_holidays(self, *, quiet: bool = False) -> int:
+        """Merge the bundled Japanese holiday list (2026–2027)."""
+        return self._import_holiday_file(resource_path(HOLIDAYS_EXAMPLE), quiet=quiet)
+
+    def _import_holiday_file(self, path: Path, *, quiet: bool) -> int:
         try:
-            data = json.loads(Path(path).read_text(encoding="utf-8"))
+            data = read_json(path)
         except (OSError, ValueError) as exc:
-            QMessageBox.warning(self, "导入失败", f"无法读取该文件：\n{exc}")
-            return
+            if not quiet:
+                QMessageBox.warning(self, "导入失败", f"无法读取该文件：\n{exc}")
+            return 0
         days = parse_holiday_file(data)
         if not days:
-            QMessageBox.warning(self, "导入失败", "文件中没有找到有效日期（格式 YYYY-MM-DD）。")
-            return
+            if not quiet:
+                QMessageBox.warning(self, "导入失败", "文件中没有找到有效日期（格式 YYYY-MM-DD）。")
+            return 0
         self._set_holidays([*self._holidays(), *days])
-        QMessageBox.information(self, "导入完成", f"已导入 {len(days)} 个日期。")
+        if not quiet:
+            QMessageBox.information(self, "导入完成", f"已导入 {len(days)} 个日期。")
+        return len(days)
 
     def _on_button(self, button: QAbstractButton) -> None:
         role = self.buttons.buttonRole(button)
