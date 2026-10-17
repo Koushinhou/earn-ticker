@@ -1,11 +1,13 @@
 # -*- mode: python ; coding: utf-8 -*-
+# Single source of truth for the exe build (used by build.ps1 and CI).
+# Bundled data files are resolved at runtime via earnticker.resources.resource_path.
 
 
 a = Analysis(
     ['run.py'],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=[('config/holidays.example.json', 'config')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
