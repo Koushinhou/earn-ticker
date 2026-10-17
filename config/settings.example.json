@@ -12,6 +12,8 @@
   "coef_weekday": 1.25,
   "coef_late_night": 1.5,
   "coef_rest_day": 1.35,
+  "coef_rest_late_night": 1.6,
+  "auto_overtime_cap_hours": 3.0,
   "take_home_enabled": false,
   "take_home_ratio": 0.8,
   "show_month_total": false,
