@@ -283,9 +283,7 @@ def overtime_amount(rules: PayRules, d: date, intervals: Iterable[Interval]) -> 
     return total
 
 
-def auto_overtime_active(
-    rules: PayRules, d: date, record: DayRecord | None, now: datetime
-) -> bool:
+def auto_overtime_active(rules: PayRules, d: date, record: DayRecord | None, now: datetime) -> bool:
     """True if auto overtime is accruing at ``now`` (inside the capped window)."""
     record = record or DayRecord()
     if now.date() != d or record.auto_stop is not None:
@@ -339,9 +337,7 @@ def overtime_pending_from(
     return datetime.combine(d, rules.end)
 
 
-def compute_day(
-    rules: PayRules, d: date, record: DayRecord | None, now: datetime
-) -> DayEarnings:
+def compute_day(rules: PayRules, d: date, record: DayRecord | None, now: datetime) -> DayEarnings:
     """Full earnings breakdown for day ``d`` as of ``now``."""
     record = record or DayRecord()
     work_day = is_work_day(rules, d)
@@ -411,9 +407,7 @@ def year_to_date(rules: PayRules, now: datetime, records: Mapping[date, DayRecor
 # overtime toggle (pure state transitions)
 
 
-def toggle_overtime(
-    rules: PayRules, d: date, record: DayRecord | None, now: datetime
-) -> DayRecord:
+def toggle_overtime(rules: PayRules, d: date, record: DayRecord | None, now: datetime) -> DayRecord:
     """Return the new record after pressing the start/end overtime toggle.
 
     If overtime is active (auto within its cap, or an open manual session) it

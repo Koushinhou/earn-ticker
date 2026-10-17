@@ -10,6 +10,7 @@ from earnticker.settings import (
     Settings,
     load_settings,
     parse_holiday_file,
+    read_settings,
     resolve_config_dir,
     save_settings,
 )
@@ -20,7 +21,7 @@ ROOT = Path(__file__).resolve().parent.parent
 
 def test_settings_round_trip(tmp_path):
     s = Settings(
-        annual_income=7_500_000,
+        annual_income=1_234_567,
         currency_symbol="$",
         rest_days=120,
         start_time="09:00",
@@ -33,16 +34,22 @@ def test_settings_round_trip(tmp_path):
         panel_x=100,
         panel_y=-20,
         show_month_total=True,
+        coef_rest_late_night=1.75,
+        auto_overtime_cap_hours=4.5,
     )
     path = tmp_path / "earnticker_settings.json"
     save_settings(path, s)
     loaded, existed = load_settings(path)
     assert existed
-    assert loaded.annual_income == 7_500_000
+    assert loaded.annual_income == 1_234_567
     assert loaded.currency_symbol == "$"
     assert loaded.work_weekdays == [0, 1, 2, 3]
     assert loaded.holidays == ["2026-01-01", "2026-11-03"]  # normalized/sorted
     assert loaded.panel_x == 100 and loaded.panel_y == -20
+    assert loaded.coef_rest_late_night == 1.75
+    assert loaded.auto_overtime_cap_hours == 4.5
+    rules = loaded.pay_rules()
+    assert rules.coef_rest_late_night == 1.75 and rules.auto_overtime_cap_hours == 4.5
     assert loaded.to_dict() == s.copy().to_dict()
     # file is human readable UTF-8 with the currency symbol intact
     assert "¥" in json.dumps(Settings().to_dict(), ensure_ascii=False)
@@ -69,8 +76,111 @@ def test_corrupt_json_falls_back_and_backs_up(tmp_path):
     s, existed = load_settings(path)
     assert existed
     assert s == Settings()
-    bak = tmp_path / "earnticker_settings.json.bak"
-    assert bak.read_text(encoding="utf-8") == "{ this is not json"
+    baks = list(tmp_path.glob("earnticker_settings.json.*.bak"))
+    assert len(baks) == 1
+    assert baks[0].read_text(encoding="utf-8") == "{ this is not json"
+    # a second corruption never overwrites the first backup
+    result = read_settings(path)
+    assert result.corrupt and result.backup is not None
+    assert len(list(tmp_path.glob("earnticker_settings.json.*.bak"))) == 2
+
+
+def test_backup_name_has_timestamp(tmp_path):
+    path = tmp_path / "earnticker_settings.json"
+    path.write_text("x", encoding="utf-8")
+    bak = settings_mod.backup_corrupt(path, datetime(2026, 10, 18, 1, 45, 0))
+    assert bak == tmp_path / "earnticker_settings.json.20261018-014500.bak"
+    again = settings_mod.backup_corrupt(path, datetime(2026, 10, 18, 1, 45, 0))
+    assert again == tmp_path / "earnticker_settings.json.20261018-014500-1.bak"
+    assert bak.exists() and again.exists()
+
+
+def test_settings_with_bom_load(tmp_path):
+    path = tmp_path / "earnticker_settings.json"
+    path.write_bytes(
+        json.dumps({"annual_income": 1_234_567, "currency_symbol": "¥"}, ensure_ascii=False).encode(
+            "utf-8-sig"
+        )
+    )
+    result = read_settings(path)
+    assert not result.corrupt
+    assert result.settings.annual_income == 1_234_567
+    assert result.settings.currency_symbol == "¥"
+    save_settings(path, result.settings)
+    assert not path.read_bytes().startswith(b"\xef\xbb\xbf")  # written without BOM
+
+
+def test_state_with_bom_loads(tmp_path):
+    path = tmp_path / "earnticker_state.json"
+    data = {
+        "version": 1,
+        "days": {"2026-10-17": {"sessions": [["2026-10-17T10:00:00", "2026-10-17T12:00:00"]]}},
+    }
+    path.write_bytes(json.dumps(data).encode("utf-8-sig"))
+    store = StateStore(path)
+    store.load()
+    assert not store.corrupt
+    assert len(store.get(date(2026, 10, 17)).sessions) == 1
+
+
+def test_old_settings_without_new_fields_load_defaults(tmp_path):
+    path = tmp_path / "s.json"
+    old = Settings().to_dict()
+    del old["coef_rest_late_night"]
+    del old["auto_overtime_cap_hours"]
+    path.write_text(json.dumps(old), encoding="utf-8")
+    s, _ = load_settings(path)
+    assert s.coef_rest_late_night == 1.6
+    assert s.auto_overtime_cap_hours == 3.0
+
+
+def test_normalized_clamps_and_rejects_non_finite():
+    s = Settings(
+        annual_income=float("nan"),
+        coef_weekday=float("inf"),
+        coef_late_night=0.5,
+        coef_rest_day=99,
+        coef_rest_late_night=float("-inf"),
+        auto_overtime_cap_hours=50,
+        take_home_ratio=float("nan"),
+        opacity=-1,
+    ).normalized()
+    assert s.annual_income == 6_000_000
+    assert s.coef_weekday == 1.25
+    assert s.coef_late_night == 1.0
+    assert s.coef_rest_day == 10.0
+    assert s.coef_rest_late_night == 1.6
+    assert s.auto_overtime_cap_hours == 12.0
+    assert s.take_home_ratio == 0.8
+    assert s.opacity == 0.0
+    assert Settings(annual_income=1e20).normalized().annual_income == 1e10
+    assert Settings(annual_income=-5).normalized().annual_income == 0
+    assert Settings(auto_overtime_cap_hours=-1).normalized().auto_overtime_cap_hours == 0
+
+
+def test_normalized_keeps_at_least_one_working_day():
+    s = Settings(days_in_year=365, rest_days=400, annual_leave_days=30).normalized()
+    assert s.rest_days == 364 and s.annual_leave_days == 0
+    assert s.pay_rules().working_days == 1
+    s2 = Settings(days_in_year=365, rest_days=300, annual_leave_days=100).normalized()
+    assert (s2.rest_days, s2.annual_leave_days) == (300, 64)
+    assert s2.pay_rules().working_days == 1
+    assert Settings(days_in_year=0).normalized().days_in_year == 1
+    assert Settings().normalized().pay_rules().working_days == 220
+
+
+def test_json_nan_and_infinity_fall_back(tmp_path):
+    path = tmp_path / "s.json"
+    path.write_text(
+        '{"annual_income": NaN, "coef_weekday": Infinity, "rest_days": 1e400,'
+        ' "auto_overtime_cap_hours": "x"}',
+        encoding="utf-8",
+    )
+    s, _ = load_settings(path)
+    assert s.annual_income == 6_000_000
+    assert s.coef_weekday == 1.25
+    assert s.rest_days == 125
+    assert s.auto_overtime_cap_hours == 3.0
 
 
 def test_wrong_types_fall_back_per_field(tmp_path):
@@ -103,7 +213,7 @@ def test_json_array_root_is_treated_as_corrupt(tmp_path):
     path.write_text("[1, 2]", encoding="utf-8")
     s, _ = load_settings(path)
     assert s == Settings()
-    assert (tmp_path / "s.json.bak").exists()
+    assert list(tmp_path.glob("s.json.*.bak"))
 
 
 def test_path_override_wins(tmp_path):
@@ -195,7 +305,9 @@ def test_state_corrupt_file(tmp_path):
     store = StateStore(path)
     store.load()
     assert store.records == {}
-    assert (tmp_path / "earnticker_state.json.bak").exists()
+    assert store.corrupt
+    assert store.backup is not None and store.backup.exists()
+    assert store.backup.name.startswith("earnticker_state.json.")
 
 
 def test_state_rollover_continues_open_session(tmp_path):

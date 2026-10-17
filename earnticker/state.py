@@ -3,13 +3,12 @@
 from __future__ import annotations
 
 import contextlib
-import json
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from .pay import DayRecord, PayRules, close_day, toggle_overtime
-from .settings import atomic_write_json, backup_corrupt
+from .settings import atomic_write_json, backup_corrupt, read_json
 
 STATE_VERSION = 1
 KEEP_DAYS = 400  # enough for year-to-date totals
@@ -57,20 +56,25 @@ class StateStore:
     def __init__(self, path: Path | None) -> None:
         self.path = path
         self.records: dict[date, DayRecord] = {}
+        self.corrupt = False  # last load found an unreadable file
+        self.backup: Path | None = None
 
     # -- persistence -----------------------------------------------------
 
     def load(self) -> None:
         self.records = {}
+        self.corrupt = False
+        self.backup = None
         if self.path is None or not self.path.exists():
             return
         try:
-            data = json.loads(self.path.read_text(encoding="utf-8"))
+            data = read_json(self.path)
             days = data.get("days", {}) if isinstance(data, dict) else None
             if not isinstance(days, dict):
                 raise ValueError("bad state file")
         except (OSError, ValueError):
-            backup_corrupt(self.path)
+            self.corrupt = True
+            self.backup = backup_corrupt(self.path)
             return
         for key, value in days.items():
             try:
@@ -111,9 +115,7 @@ class StateStore:
         rec = self.get(d)
         self.records[d] = DayRecord(rec.sessions, rec.auto_stop, now)
 
-    def rollover(
-        self, rules: PayRules, old: date, new: date, now: datetime | None = None
-    ) -> None:
+    def rollover(self, rules: PayRules, old: date, new: date, now: datetime | None = None) -> None:
         """Close ``old``; continue an open manual session on ``new`` if the app
         was alive across midnight (see ``close_day``)."""
         closed, continue_open = close_day(rules, old, self.records.get(old), now)

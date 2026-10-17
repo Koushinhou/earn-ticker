@@ -2,22 +2,28 @@
 
 from __future__ import annotations
 
-import contextlib
 import json
+import math
 import os
 import shutil
 import sys
 import tempfile
 from dataclasses import asdict, dataclass, field, fields
-from datetime import date, time
+from datetime import date, datetime, time
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from .pay import PayRules
 
 APP_NAME = "EarnTicker"
 SETTINGS_FILE = "earnticker_settings.json"
 STATE_FILE = "earnticker_state.json"
+# JSON files written by other tools (e.g. Notepad) may start with a BOM
+READ_ENCODING = "utf-8-sig"
+
+MAX_ANNUAL_INCOME = 1e10
+COEF_RANGE = (1.0, 10.0)
+CAP_RANGE = (0.0, 12.0)
 
 
 def _default_weekdays() -> list[int]:
@@ -42,6 +48,8 @@ class Settings:
     coef_weekday: float = 1.25
     coef_late_night: float = 1.5
     coef_rest_day: float = 1.35
+    coef_rest_late_night: float = 1.6
+    auto_overtime_cap_hours: float = 3.0
     # take-home
     take_home_enabled: bool = False
     take_home_ratio: float = 0.8
@@ -81,13 +89,28 @@ class Settings:
         return result.normalized()
 
     def normalized(self) -> Settings:
-        """Clamp values to sane ranges (never raises)."""
-        self.days_in_year = max(1, min(self.days_in_year, 366))
-        self.rest_days = max(0, self.rest_days)
-        self.annual_leave_days = max(0, self.annual_leave_days)
-        self.annual_income = max(0.0, self.annual_income)
-        self.take_home_ratio = max(0.0, min(self.take_home_ratio, 1.0))
-        self.opacity = max(0.0, min(self.opacity, 1.0))
+        """Clamp values to sane ranges (never raises).
+
+        NaN / infinity fall back to the default; finite values are clamped.
+        Rest days and annual leave are reduced so at least one working day
+        remains.
+        """
+        d = _DEFAULTS
+        self.annual_income = _clamp_float(
+            self.annual_income, d.annual_income, 0.0, MAX_ANNUAL_INCOME
+        )
+        for name in ("coef_weekday", "coef_late_night", "coef_rest_day", "coef_rest_late_night"):
+            setattr(self, name, _clamp_float(getattr(self, name), getattr(d, name), *COEF_RANGE))
+        self.auto_overtime_cap_hours = _clamp_float(
+            self.auto_overtime_cap_hours, d.auto_overtime_cap_hours, *CAP_RANGE
+        )
+        self.take_home_ratio = _clamp_float(self.take_home_ratio, d.take_home_ratio, 0.0, 1.0)
+        self.opacity = _clamp_float(self.opacity, d.opacity, 0.0, 1.0)
+        self.days_in_year = max(1, min(int(self.days_in_year), 366))
+        self.rest_days = max(0, min(int(self.rest_days), self.days_in_year - 1))
+        self.annual_leave_days = max(
+            0, min(int(self.annual_leave_days), self.days_in_year - 1 - self.rest_days)
+        )
         self.today_decimals = max(0, min(self.today_decimals, 4))
         self.total_decimals = max(0, min(self.total_decimals, 4))
         self.font_size = max(10, min(self.font_size, 120))
@@ -117,9 +140,24 @@ class Settings:
             coef_weekday=float(self.coef_weekday),
             coef_late_night=float(self.coef_late_night),
             coef_rest_day=float(self.coef_rest_day),
+            coef_rest_late_night=float(self.coef_rest_late_night),
+            auto_overtime_cap_hours=float(self.auto_overtime_cap_hours),
             take_home_enabled=bool(self.take_home_enabled),
             take_home_ratio=float(self.take_home_ratio),
         )
+
+
+_DEFAULTS = Settings()
+
+
+def _clamp_float(value: Any, default: float, lo: float, hi: float) -> float:
+    try:
+        x = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    if not math.isfinite(x):
+        return default
+    return max(lo, min(x, hi))
 
 
 def _coerce(value: Any, default: Any, name: str) -> Any:
@@ -145,7 +183,7 @@ def _coerce(value: Any, default: Any, name: str) -> Any:
             if name == "work_weekdays":
                 return [int(v) for v in value]
             return [str(v) for v in value]
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     return None
 
@@ -239,26 +277,55 @@ def resolve_config_dir(
 # load / save
 
 
-def backup_corrupt(path: Path) -> None:
-    with contextlib.suppress(OSError):
-        shutil.copyfile(path, path.with_name(path.name + ".bak"))
+def backup_corrupt(path: Path, now: datetime | None = None) -> Path | None:
+    """Copy a corrupt file to ``<name>.<YYYYmmdd-HHMMSS>.bak`` (never overwritten).
+
+    Returns the backup path, or None if the copy failed.
+    """
+    stamp = (now or datetime.now()).strftime("%Y%m%d-%H%M%S")
+    target = path.with_name(f"{path.name}.{stamp}.bak")
+    n = 1
+    while target.exists():
+        target = path.with_name(f"{path.name}.{stamp}-{n}.bak")
+        n += 1
+    try:
+        shutil.copyfile(path, target)
+    except OSError:
+        return None
+    return target
+
+
+def read_json(path: Path) -> Any:
+    return json.loads(path.read_text(encoding=READ_ENCODING))
+
+
+class SettingsLoad(NamedTuple):
+    settings: Settings
+    existed: bool
+    corrupt: bool  # file was unreadable; defaults used
+    backup: Path | None  # where the corrupt file was copied to
+
+
+def read_settings(path: Path) -> SettingsLoad:
+    """Load settings and report whether a corrupt file was replaced. Never raises."""
+    if not path.exists():
+        return SettingsLoad(Settings(), False, False, None)
+    try:
+        data = read_json(path)
+        if not isinstance(data, dict):
+            raise ValueError("settings root must be an object")
+    except (OSError, ValueError):
+        return SettingsLoad(Settings(), True, True, backup_corrupt(path))
+    return SettingsLoad(Settings.from_dict(data), True, False, None)
 
 
 def load_settings(path: Path) -> tuple[Settings, bool]:
     """Load settings; returns ``(settings, existed)``. Never raises.
 
-    A corrupt file is copied to ``<name>.bak`` and defaults are returned.
+    A corrupt file is copied to a timestamped ``.bak`` and defaults are returned.
     """
-    if not path.exists():
-        return Settings(), False
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(data, dict):
-            raise ValueError("settings root must be an object")
-    except (OSError, ValueError):
-        backup_corrupt(path)
-        return Settings(), True
-    return Settings.from_dict(data), True
+    result = read_settings(path)
+    return result.settings, result.existed
 
 
 def atomic_write_json(path: Path, data: Any) -> None:
