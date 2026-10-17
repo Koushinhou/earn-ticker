@@ -111,11 +111,14 @@ class StateStore:
         rec = self.get(d)
         self.records[d] = DayRecord(rec.sessions, rec.auto_stop, now)
 
-    def rollover(self, rules: PayRules, old: date, new: date) -> None:
-        """Close ``old`` at midnight; continue an open manual session on ``new``."""
-        closed, was_open = close_day(rules, old, self.records.get(old))
+    def rollover(
+        self, rules: PayRules, old: date, new: date, now: datetime | None = None
+    ) -> None:
+        """Close ``old``; continue an open manual session on ``new`` if the app
+        was alive across midnight (see ``close_day``)."""
+        closed, continue_open = close_day(rules, old, self.records.get(old), now)
         self.records[old] = closed
-        if was_open and new == old + timedelta(days=1):
+        if continue_open and new == old + timedelta(days=1):
             midnight = datetime.combine(new, datetime.min.time())
             rec = self.get(new)
             self.records[new] = DayRecord(

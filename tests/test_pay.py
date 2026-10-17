@@ -19,6 +19,7 @@ RULES = PayRules()  # annual 6,000,000, 220 days, 08:45-17:15
 MON = date(2026, 10, 19)  # Monday
 SAT = date(2026, 10, 17)  # Saturday
 SUN = date(2026, 10, 18)
+TUE = date(2026, 10, 20)
 
 DAILY = 6_000_000 / 220
 HOURLY = DAILY / 8.5
@@ -115,15 +116,78 @@ def test_auto_overtime_weekday_125_after_end():
     assert e.phase == "overtime"
 
 
-def test_auto_overtime_until_2300_spans_late_night():
+def test_auto_overtime_capped_at_end_plus_3h():
+    # never stopped, at 23:00 only 17:15-20:15 counts
     e = compute_day(RULES, MON, None, at(MON, 23, 0))
-    weekday_part = 4.75 * HOURLY * 1.25
-    late_part = 1.0 * HOURLY * 1.5
-    assert weekday_part == pytest.approx(19050.80, abs=0.01)
-    assert late_part == pytest.approx(4812.83, abs=0.01)
-    assert e.overtime == pytest.approx(weekday_part + late_part)
-    assert e.overtime == pytest.approx(23863.64, abs=0.01)
-    assert e.current_coef == 1.5
+    assert e.overtime == pytest.approx(3 * HOURLY * 1.25)
+    assert e.overtime == pytest.approx(12032.09, abs=0.01)
+    assert e.total == pytest.approx(39304.81, abs=0.01)
+    assert not e.overtime_running
+    assert not e.overtime_active
+    assert e.phase == "after"
+    assert e.current_coef == 0
+
+
+def test_auto_overtime_cap_boundary_2015():
+    before = compute_day(RULES, MON, None, at(MON, 20, 14, 59))
+    assert before.overtime_running and before.overtime_active
+    assert overtime_running(RULES, MON, None, at(MON, 20, 14, 59))
+    assert not overtime_running(RULES, MON, None, at(MON, 20, 15))
+    at_cap = compute_day(RULES, MON, None, at(MON, 20, 15))
+    later = compute_day(RULES, MON, None, at(MON, 20, 16))
+    assert at_cap.overtime == pytest.approx(3 * HOURLY * 1.25)
+    assert later.overtime == at_cap.overtime
+    # toggling after the cap starts a manual session (nothing to stop)
+    rec = toggle_overtime(RULES, MON, None, at(MON, 20, 30))
+    assert rec.has_open_session and rec.auto_stop is None
+
+
+def test_auto_overtime_cap_is_configurable():
+    rules = PayRules(auto_overtime_cap_hours=0.5)
+    e = compute_day(rules, MON, None, at(MON, 19))
+    assert e.overtime == pytest.approx(0.5 * HOURLY * 1.25)
+    zero = PayRules(auto_overtime_cap_hours=0)
+    e0 = compute_day(zero, MON, None, at(MON, 18))
+    assert e0.overtime == 0 and not e0.overtime_running
+    uncapped = PayRules(auto_overtime_cap_hours=12)
+    e12 = compute_day(uncapped, MON, None, at(MON, 23))
+    assert e12.overtime == pytest.approx(4.75 * HOURLY * 1.25 + HOURLY * 1.5)
+    assert e12.current_coef == 1.5
+
+
+def test_manual_session_past_cap_still_accrues():
+    # weekday: auto 17:15-20:15 plus manual 21:00-23:00 (not capped)
+    rec = DayRecord(sessions=((at(MON, 21), at(MON, 23)),))
+    e = compute_day(RULES, MON, rec, at(MON, 23, 30))
+    manual = HOURLY * 1.25 + HOURLY * 1.5
+    assert manual == pytest.approx(8823.53, abs=0.01)
+    assert e.overtime == pytest.approx(3 * HOURLY * 1.25 + manual)
+    assert e.overtime == pytest.approx(20855.62, abs=0.01)
+    # an open manual session keeps running after the cap
+    rec = toggle_overtime(RULES, MON, None, at(MON, 21))
+    e = compute_day(RULES, MON, rec, at(MON, 22, 30))
+    assert e.overtime_running and e.current_coef == 1.5
+    assert e.overtime == pytest.approx(3 * HOURLY * 1.25 + HOURLY * 1.25 + 0.5 * HOURLY * 1.5)
+
+
+def test_manual_session_started_in_regular_hours_pending_until_end():
+    rules = PayRules(auto_overtime=False)
+    rec = toggle_overtime(rules, MON, None, at(MON, 15))
+    e = compute_day(rules, MON, rec, at(MON, 16))
+    assert e.overtime_active
+    assert not e.overtime_running
+    assert e.overtime_pending_from == at(MON, 17, 15)
+    assert e.phase == "working"
+    assert e.overtime == 0
+    e2 = compute_day(rules, MON, rec, at(MON, 17, 15))
+    assert e2.overtime_running and e2.overtime_pending_from is None
+    assert e2.current_coef == 1.25
+    # with auto overtime on the same session is also pending until 17:15
+    e3 = compute_day(RULES, MON, toggle_overtime(RULES, MON, None, at(MON, 15)), at(MON, 16))
+    assert not e3.overtime_running and e3.overtime_pending_from == at(MON, 17, 15)
+    # toggling while pending closes the session
+    closed = toggle_overtime(rules, MON, rec, at(MON, 16))
+    assert not closed.has_open_session
 
 
 def test_manual_session_2100_to_2300_spans_both_rates():
@@ -202,14 +266,18 @@ def test_rest_day_running_session_and_coef():
     assert e.overtime == pytest.approx(HOURLY * 1.35)
 
 
-def test_rest_day_late_night_uses_max_rule():
-    rec = DayRecord(sessions=((at(SAT, 21), at(SAT, 23)),))
+def test_rest_day_late_night_uses_own_coefficient():
+    rec = DayRecord(sessions=((at(SAT, 22), at(SAT, 23)),))
     e = compute_day(RULES, SAT, rec, at(SAT, 23, 30))
-    assert e.overtime == pytest.approx(HOURLY * 1.35 + HOURLY * 1.5)
-    # if the rest-day coefficient is higher it wins at night too
-    high = PayRules(coef_rest_day=1.6)
-    e2 = compute_day(high, SAT, rec, at(SAT, 23, 30))
-    assert e2.overtime == pytest.approx(2 * HOURLY * 1.6)
+    assert e.overtime == pytest.approx(HOURLY * 1.6)
+    assert e.overtime == pytest.approx(5133.69, abs=0.01)
+    rec2 = DayRecord(sessions=((at(SAT, 21), at(SAT, 23)),))
+    e2 = compute_day(RULES, SAT, rec2, at(SAT, 23, 30))
+    assert e2.overtime == pytest.approx(HOURLY * 1.35 + HOURLY * 1.6)
+    custom = PayRules(coef_rest_late_night=2.0)
+    assert compute_day(custom, SAT, rec, at(SAT, 23, 30)).overtime == pytest.approx(HOURLY * 2)
+    running = toggle_overtime(RULES, SAT, None, at(SAT, 22))
+    assert compute_day(RULES, SAT, running, at(SAT, 22, 30)).current_coef == 1.6
 
 
 def test_rest_day_no_auto_overtime():
@@ -230,15 +298,59 @@ def test_overtime_stops_at_midnight_and_past_day_uses_last_seen():
 
 
 def test_close_day_caps_at_midnight_and_continues_session():
+    # app alive across midnight: last seen 23:59:30, rollover at 00:00:01
     rec = toggle_overtime(RULES, SAT, None, at(SAT, 23))
-    closed, was_open = close_day(RULES, SAT, rec)
-    assert was_open
+    rec = DayRecord(rec.sessions, rec.auto_stop, at(SAT, 23, 59, 30))
+    closed, cont = close_day(RULES, SAT, rec, at(SUN, 0, 0, 1))
+    assert cont
+    assert closed.last_seen == at(SUN, 0)
     e = compute_day(RULES, SAT, closed, at(SUN, 1))
-    assert e.overtime == pytest.approx(HOURLY * 1.5)
-    # work day: auto overtime closed at midnight
-    closed_mon, _ = close_day(RULES, MON, DayRecord())
-    e2 = compute_day(RULES, MON, closed_mon, at(date(2026, 10, 20), 1))
-    assert e2.overtime == pytest.approx(4.75 * HOURLY * 1.25 + 2 * HOURLY * 1.5)
+    assert e.overtime == pytest.approx(HOURLY * 1.6)
+    # work day with app alive at midnight: auto overtime closed at midnight but capped
+    closed_mon, _ = close_day(RULES, MON, DayRecord(last_seen=at(MON, 23, 59, 30)))
+    assert closed_mon.auto_stop == at(TUE, 0)
+    e2 = compute_day(RULES, MON, closed_mon, at(TUE, 1))
+    assert e2.overtime == pytest.approx(3 * HOURLY * 1.25)
+    uncapped = PayRules(auto_overtime_cap_hours=12)
+    e3 = compute_day(uncapped, MON, closed_mon, at(TUE, 1))
+    assert e3.overtime == pytest.approx(4.75 * HOURLY * 1.25 + 2 * HOURLY * 1.5)
+
+
+def test_close_day_after_sleep_across_midnight_uses_last_seen():
+    # M1 repro: Monday last seen 20:00, PC slept, woke Tuesday 08:00
+    rec = DayRecord(last_seen=at(MON, 20))
+    closed, cont = close_day(RULES, MON, rec, at(TUE, 8))
+    assert not cont
+    assert closed.auto_stop == at(MON, 20, 1)
+    assert closed.last_seen == at(MON, 20, 1)
+    e = compute_day(RULES, MON, closed, at(TUE, 8))
+    expected = 2.75 * HOURLY * 1.25 + 60 * PER_SEC * 1.25
+    assert e.overtime == pytest.approx(expected)
+    assert e.overtime == pytest.approx(11029.41 + 66.84, abs=0.02)
+    # month total is not inflated
+    mtd = month_to_date(RULES, at(TUE, 8), {MON: closed})
+    assert mtd == pytest.approx(13 * DAILY + expected)
+
+
+def test_close_day_does_not_continue_open_session_after_long_sleep():
+    rec = toggle_overtime(RULES, SAT, None, at(SAT, 21))
+    rec = DayRecord(rec.sessions, rec.auto_stop, at(SAT, 21, 30))
+    closed, cont = close_day(RULES, SAT, rec, at(SUN, 9))
+    assert not cont
+    assert closed.sessions == ((at(SAT, 21), at(SAT, 21, 31)),)
+    # slept from 23:59:30 to 09:00: last_seen near midnight but now is not
+    rec2 = DayRecord(rec.sessions, None, at(SAT, 23, 59, 30))
+    _, cont2 = close_day(RULES, SAT, rec2, at(SUN, 9))
+    assert not cont2
+
+
+def test_close_day_without_last_seen_counts_nothing_open_ended():
+    rec = toggle_overtime(RULES, SAT, None, at(SAT, 21))
+    closed, cont = close_day(RULES, SAT, DayRecord(rec.sessions), at(SUN, 9))
+    assert not cont
+    assert compute_day(RULES, SAT, closed, at(SUN, 9)).overtime == 0
+    closed_mon, _ = close_day(RULES, MON, DayRecord(), at(TUE, 9))
+    assert compute_day(RULES, MON, closed_mon, at(TUE, 9)).overtime == 0
 
 
 def test_overtime_running_only_for_today():

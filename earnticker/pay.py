@@ -11,8 +11,11 @@ Rules (see README / docs/HAND_CALC.md):
 * hourly = daily / daily_hours  (daily_hours = end - start, no lunch deduction)
 * per_second = hourly / 3600
 * Regular pay accrues linearly between start and end on work days.
-* Overtime is paid at hourly x coefficient. Late-night seconds (22:00-05:00)
-  use the late-night coefficient (on rest days: max(rest, late-night)).
+* Overtime is paid at hourly x coefficient: weekday, weekday late night
+  (22:00-05:00), rest day and rest-day late night each have their own
+  coefficient (they never stack).
+* Auto overtime on work days runs from ``end`` for at most
+  ``auto_overtime_cap_hours``; manual sessions are not capped.
 * Overtime accrual for a day stops at local midnight.
 * For past days, anything still "running" (auto overtime that was never
   stopped, an open manual session) is counted until ``last_seen``, the last
@@ -27,6 +30,12 @@ from datetime import date, datetime, time, timedelta
 
 LATE_NIGHT_START = time(22, 0)
 LATE_NIGHT_END = time(5, 0)
+
+# The app records ``last_seen`` about once a minute, so up to this much time
+# after it is assumed to have been running as well.
+LAST_SEEN_GRACE = timedelta(seconds=60)
+# Max distance from midnight for the app to count as "alive across midnight".
+ALIVE_GAP = timedelta(minutes=2)
 
 Interval = tuple[datetime, datetime]
 
@@ -47,6 +56,8 @@ class PayRules:
     coef_weekday: float = 1.25
     coef_late_night: float = 1.5
     coef_rest_day: float = 1.35
+    coef_rest_late_night: float = 1.6
+    auto_overtime_cap_hours: float = 3.0
     take_home_enabled: bool = False
     take_home_ratio: float = 0.8
 
@@ -83,6 +94,15 @@ class PayRules:
         return self.hourly / 3600.0
 
     @property
+    def has_auto_overtime(self) -> bool:
+        return self.auto_overtime and self.daily_seconds > 0 and self.auto_overtime_cap_hours > 0
+
+    def auto_window(self, d: date) -> Interval:
+        """Window in which auto overtime may accrue on work day ``d``."""
+        a0 = datetime.combine(d, self.end)
+        return a0, a0 + timedelta(hours=max(self.auto_overtime_cap_hours, 0.0))
+
+    @property
     def ratio(self) -> float:
         """Multiplier applied to every displayed amount."""
         return self.take_home_ratio if self.take_home_enabled else 1.0
@@ -113,9 +133,12 @@ class DayEarnings:
     regular: float
     overtime: float
     phase: str  # "rest", "before", "working", "after", "overtime", "future"
-    overtime_running: bool = False
+    overtime_running: bool = False  # overtime is accruing at ``now``
     current_coef: float = 0.0
     overtime_intervals: tuple[Interval, ...] = field(default=())
+    overtime_active: bool = False  # toggle state: open session or auto overtime
+    # set when a manual session is open but not accruing yet (inside regular hours)
+    overtime_pending_from: datetime | None = None
 
     @property
     def total(self) -> float:
@@ -173,9 +196,7 @@ def is_late_night(moment: datetime) -> bool:
 def overtime_coef(rules: PayRules, work_day: bool, late_night: bool) -> float:
     if work_day:
         return rules.coef_late_night if late_night else rules.coef_weekday
-    if late_night:
-        return max(rules.coef_rest_day, rules.coef_late_night)
-    return rules.coef_rest_day
+    return rules.coef_rest_late_night if late_night else rules.coef_rest_day
 
 
 def _split_late_night(a: datetime, b: datetime) -> list[tuple[datetime, datetime, bool]]:
@@ -235,10 +256,10 @@ def overtime_intervals(
     work_day = is_work_day(rules, d)
 
     raw: list[Interval] = []
-    if work_day and rules.auto_overtime and rules.daily_seconds > 0:
-        a0 = datetime.combine(d, rules.end)
+    if work_day and rules.has_auto_overtime:
+        a0, cap_end = rules.auto_window(d)
         a1 = record.auto_stop if record.auto_stop is not None else cut
-        raw.append((a0, min(a1, limit)))
+        raw.append((a0, min(a1, cap_end, limit)))
     for s, e in record.sessions:
         end = e if e is not None else cut
         raw.append((max(s, day_start), min(end, limit)))
@@ -262,16 +283,60 @@ def overtime_amount(rules: PayRules, d: date, intervals: Iterable[Interval]) -> 
     return total
 
 
-def overtime_running(rules: PayRules, d: date, record: DayRecord | None, now: datetime) -> bool:
-    """True if overtime is accruing at ``now`` (only meaningful for today)."""
+def auto_overtime_active(
+    rules: PayRules, d: date, record: DayRecord | None, now: datetime
+) -> bool:
+    """True if auto overtime is accruing at ``now`` (inside the capped window)."""
+    record = record or DayRecord()
+    if now.date() != d or record.auto_stop is not None:
+        return False
+    if not (is_work_day(rules, d) and rules.has_auto_overtime):
+        return False
+    a0, cap_end = rules.auto_window(d)
+    return a0 <= now < cap_end
+
+
+def overtime_active(rules: PayRules, d: date, record: DayRecord | None, now: datetime) -> bool:
+    """Toggle state: a manual session is open or auto overtime is active.
+
+    This decides whether 「开始加班」 or 「结束加班」 is offered.
+    """
     record = record or DayRecord()
     if now.date() != d:
         return False
-    if record.has_open_session:
+    return record.has_open_session or auto_overtime_active(rules, d, record, now)
+
+
+def _in_regular_hours(rules: PayRules, d: date, moment: datetime) -> bool:
+    if not is_work_day(rules, d) or rules.daily_seconds <= 0:
+        return False
+    return datetime.combine(d, rules.start) <= moment < datetime.combine(d, rules.end)
+
+
+def overtime_running(rules: PayRules, d: date, record: DayRecord | None, now: datetime) -> bool:
+    """True if overtime is actually accruing at ``now`` (only meaningful for today).
+
+    A manual session opened during regular hours is active but does not
+    accrue until the end time.
+    """
+    record = record or DayRecord()
+    if now.date() != d:
+        return False
+    if auto_overtime_active(rules, d, record, now):
         return True
-    if is_work_day(rules, d) and rules.auto_overtime and rules.daily_seconds > 0:
-        return now >= datetime.combine(d, rules.end) and record.auto_stop is None
-    return False
+    return record.has_open_session and not _in_regular_hours(rules, d, now)
+
+
+def overtime_pending_from(
+    rules: PayRules, d: date, record: DayRecord | None, now: datetime
+) -> datetime | None:
+    """When an open but not yet accruing manual session starts to count."""
+    record = record or DayRecord()
+    if now.date() != d or not record.has_open_session:
+        return None
+    if overtime_running(rules, d, record, now):
+        return None
+    return datetime.combine(d, rules.end)
 
 
 def compute_day(
@@ -289,6 +354,8 @@ def compute_day(
     intervals = overtime_intervals(rules, d, record, now)
     overtime = overtime_amount(rules, d, intervals) * ratio
     running = overtime_running(rules, d, record, now)
+    active = overtime_active(rules, d, record, now)
+    pending = overtime_pending_from(rules, d, record, now)
     coef = overtime_coef(rules, work_day, is_late_night(now)) if running else 0.0
 
     if running:
@@ -301,7 +368,9 @@ def compute_day(
         phase = "working"
     else:
         phase = "after"
-    return DayEarnings(d, work_day, regular, overtime, phase, running, coef, tuple(intervals))
+    return DayEarnings(
+        d, work_day, regular, overtime, phase, running, coef, tuple(intervals), active, pending
+    )
 
 
 def period_total(
@@ -347,43 +416,50 @@ def toggle_overtime(
 ) -> DayRecord:
     """Return the new record after pressing the start/end overtime toggle.
 
-    If overtime is running (auto or manual) it is stopped: open manual sessions
-    are closed at ``now`` and, if auto overtime was running, ``auto_stop`` is
-    recorded. Otherwise a new manual session starts at ``now``.
+    If overtime is active (auto within its cap, or an open manual session) it
+    is stopped: open manual sessions are closed at ``now`` and, if auto
+    overtime was active, ``auto_stop`` is recorded. Otherwise a new manual
+    session starts at ``now``.
     """
     record = record or DayRecord()
-    if overtime_running(rules, d, record, now):
+    if overtime_active(rules, d, record, now):
         sessions = tuple((s, e if e is not None else now) for s, e in record.sessions)
         auto_stop = record.auto_stop
-        auto_active = (
-            is_work_day(rules, d)
-            and rules.auto_overtime
-            and rules.daily_seconds > 0
-            and now >= datetime.combine(d, rules.end)
-            and auto_stop is None
-        )
-        if auto_active:
+        if auto_overtime_active(rules, d, record, now):
             auto_stop = now
         return DayRecord(sessions, auto_stop, record.last_seen)
     return DayRecord((*record.sessions, (now, None)), record.auto_stop, record.last_seen)
 
 
-def close_day(rules: PayRules, d: date, record: DayRecord | None) -> tuple[DayRecord, bool]:
-    """Close day ``d`` at midnight (called on date rollover while running).
+def close_day(
+    rules: PayRules, d: date, record: DayRecord | None, now: datetime | None = None
+) -> tuple[DayRecord, bool]:
+    """Close day ``d`` on date rollover.
 
-    Returns the closed record and whether a manual session was open (so the
-    caller can continue it on the next day).
+    Open-ended overtime (open manual sessions, auto overtime never stopped) is
+    closed at ``cut = min(midnight, last_seen + LAST_SEEN_GRACE)``: if the PC
+    slept across midnight only the time the app was actually seen running
+    counts. Without ``last_seen`` nothing open-ended is counted.
+
+    Returns the closed record and whether an open manual session should be
+    continued on the next day. That only happens when the app was alive across
+    midnight (``last_seen`` and ``now`` both within ``ALIVE_GAP`` of it).
     """
     record = record or DayRecord()
-    _, midnight = day_bounds(d)
+    day_start, midnight = day_bounds(d)
+    if record.last_seen is None:
+        cut = day_start
+    else:
+        cut = min(midnight, max(record.last_seen + LAST_SEEN_GRACE, day_start))
     was_open = record.has_open_session
-    sessions = tuple((s, e if e is not None else midnight) for s, e in record.sessions)
+    sessions = tuple((s, e if e is not None else max(s, cut)) for s, e in record.sessions)
     auto_stop = record.auto_stop
-    if (
-        auto_stop is None
-        and is_work_day(rules, d)
-        and rules.auto_overtime
-        and rules.daily_seconds > 0
-    ):
-        auto_stop = midnight
-    return DayRecord(sessions, auto_stop, midnight), was_open
+    if auto_stop is None and is_work_day(rules, d) and rules.has_auto_overtime:
+        auto_stop = cut
+    alive = (
+        record.last_seen is not None
+        and record.last_seen >= midnight - ALIVE_GAP
+        and (now is None or now <= midnight + ALIVE_GAP)
+    )
+    last_seen = cut if record.last_seen is not None else None
+    return DayRecord(sessions, auto_stop, last_seen), was_open and alive

@@ -203,11 +203,24 @@ def test_state_rollover_continues_open_session(tmp_path):
     rules = PayRules()
     sat, sun = date(2026, 10, 17), date(2026, 10, 18)
     store.toggle(rules, datetime(2026, 10, 17, 23, 0))
-    store.rollover(rules, sat, sun)
+    store.touch(datetime(2026, 10, 17, 23, 59, 30))
+    store.rollover(rules, sat, sun, datetime(2026, 10, 18, 0, 0, 1))
     assert not store.get(sat).has_open_session
     assert store.get(sun).sessions == ((datetime(2026, 10, 18, 0, 0), None),)
     e = compute_day(rules, sun, store.get(sun), datetime(2026, 10, 18, 1, 0))
-    assert e.overtime == pytest.approx(rules.hourly * 1.5)
+    assert e.overtime == pytest.approx(rules.hourly * 1.6)
+
+
+def test_state_rollover_after_sleep_does_not_continue(tmp_path):
+    store = StateStore(tmp_path / "st.json")
+    rules = PayRules()
+    sat, sun = date(2026, 10, 17), date(2026, 10, 18)
+    store.toggle(rules, datetime(2026, 10, 17, 21, 0))
+    store.touch(datetime(2026, 10, 17, 21, 30))
+    store.rollover(rules, sat, sun, datetime(2026, 10, 18, 9, 0))
+    closed = ((datetime(2026, 10, 17, 21), datetime(2026, 10, 17, 21, 31)),)
+    assert store.get(sat).sessions == closed
+    assert store.get(sun).sessions == ()
 
 
 def test_state_touch_and_prune(tmp_path):

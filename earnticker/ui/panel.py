@@ -150,7 +150,7 @@ class Panel(QWidget):
         today = now.date()
 
         if self._last_date is not None and today != self._last_date:
-            self.store.rollover(rules, self._last_date, today)
+            self.store.rollover(rules, self._last_date, today, now)
             self._prev = None
         self._last_date = today
         if self._last_touch is None or abs(now - self._last_touch) >= TOUCH_INTERVAL:
