@@ -9,3 +9,6 @@ dist/
 # Local settings may contain real income data - never commit
 settings.json
 earnticker_settings.json
+earnticker_state.json
+*.json.bak
+earnticker.lock
